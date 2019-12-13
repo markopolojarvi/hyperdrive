@@ -1,4 +1,5 @@
-const path = require('path').posix
+const pathRoot = require('path')
+const path = pathRoot.posix || pathRoot
 const { EventEmitter } = require('events')
 
 const collect = require('stream-collector')
@@ -10,8 +11,9 @@ const pumpify = require('pumpify')
 const pump = require('pump')
 
 const coreByteStream = require('hypercore-byte-stream')
+const HypercoreProtocol = require('hypercore-protocol')
 const MountableHypertrie = require('mountable-hypertrie')
-const { Corestore } = require('corestore')
+const Corestore = require('corestore')
 const { Stat } = require('hyperdrive-schemas')
 
 const createFileDescriptor = require('./lib/fd')
@@ -37,12 +39,13 @@ class Hyperdrive extends EventEmitter {
     if (!opts) opts = {}
 
     this.opts = opts
-    this.key = null
+    this.key = key
     this.discoveryKey = null
     this.live = true
     this.sparse = opts.sparse !== false
     this.sparseMetadata = opts.sparseMetadata !== false
 
+    this._namespace = opts.namespace
     this._corestore = defaultCorestore(storage, {
       ...opts,
       valueEncoding: 'binary',
@@ -51,36 +54,25 @@ class Hyperdrive extends EventEmitter {
       extensions: opts.extensions
     })
     if (this._corestore !== storage) this._corestore.on('error', err => this.emit('error', err))
-
-
-    const metadataOpts = {
-      key,
-      sparse: this.sparseMetadata,
-      secretKey: (opts.keyPair) ? opts.keyPair.secretKey : opts.secretKey,
-      extensions: opts.extensions
+    if (opts.namespace) {
+      this._corestore = this._corestore.namespace(opts.namespace)
     }
 
-    if (storage instanceof Corestore && storage.isDefaultSet()) {
-      this.metadata = this._corestore.get({
-        ...metadataOpts,
-        discoverable: true
-      })
-    } else {
-      this.metadata = this._corestore.default(metadataOpts)
-    }
-
-    this._db = opts._db || new MountableHypertrie(this._corestore, key, {
-      feed: this.metadata,
-      sparse: this.sparseMetadata
-    })
-    this._db.on('feed', feed => this.emit('metadata-feed', feed))
-    this._db.on('error', err => this.emit('error', err))
+    // Set in ready.
+    this.metadata = null
+    this._db = opts._db
 
     this._contentStates = opts.contentStates || new Map()
-    if (opts._content) this._contentStates.set(this._db, new ContentState(opts._content))
-
     this._fds = []
     this._writingFds = new Map()
+
+    this._metadataOpts = {
+      key,
+      sparse: this.sparseMetadata,
+      keyPair: opts.keyPair,
+      extensions: opts.extensions
+    }
+    this._checkoutContent = opts._content
 
     this.ready = thunky(this._ready.bind(this))
     this.ready(onReady)
@@ -110,35 +102,46 @@ class Hyperdrive extends EventEmitter {
 
   _ready (cb) {
     const self = this
-
-    self.metadata.on('error', onerror)
-    self.metadata.on('append', update)
-    self.metadata.on('extension', extension)
-    self.metadata.on('peer-add', peeradd)
-    self.metadata.on('peer-remove', peerremove)
-
-    return self.metadata.ready(err => {
+    return this._corestore.ready(err => {
       if (err) return cb(err)
+      this.metadata = this._corestore.default(this._metadataOpts)
+      this.metadata.ifAvailable.wait()
+      this._db = this._db || new MountableHypertrie(this._corestore, this.key, {
+        feed: this.metadata,
+        sparse: this.sparseMetadata
+      })
+      this._db.on('feed', feed => this.emit('metadata-feed', feed))
+      this._db.on('error', err => this.emit('error', err))
 
-      const rootContentKeyPair = self.metadata.secretKey ? contentKeyPair(self.metadata.secretKey) : {}
+      if (this._checkoutContent) this._contentStates.set(this._db, new ContentState(this._checkoutContent))
 
-      /**
-       * TODO: Update comment to reflect mounts.
-       *
-       * If a db is provided as input, ensure that a contentFeed is also provided, then return (this is a checkout).
-       * If the metadata feed is writable:
-       *    If the metadata feed has length 0, then the db should be initialized with the content feed key as metadata.
-       *    Else, initialize the db without metadata and load the content feed key from the header.
-       * If the metadata feed is readable:
-       *    Initialize the db without metadata and load the content feed key from the header.
-       */
-      if (self.opts._db) {
-        checkout()
-      } else if (self.metadata.writable && !self.metadata.length) {
-        initialize(rootContentKeyPair)
-      } else {
-        restore(rootContentKeyPair)
-      }
+      self.metadata.on('error', onerror)
+      self.metadata.on('append', update)
+      self.metadata.on('extension', extension)
+      self.metadata.on('peer-add', peeradd)
+      self.metadata.on('peer-remove', peerremove)
+
+      return self.metadata.ready(err => {
+        if (err) return done(err)
+
+        /**
+        * TODO: Update comment to reflect mounts.
+        *
+        * If a db is provided as input, ensure that a contentFeed is also provided, then return (this is a checkout).
+        * If the metadata feed is writable:
+        *    If the metadata feed has length 0, then the db should be initialized with the content feed key as metadata.
+        *    Else, initialize the db without metadata and load the content feed key from the header.
+        * If the metadata feed is readable:
+        *    Initialize the db without metadata and load the content feed key from the header.
+        */
+        if (self.opts._db) {
+          checkout()
+        } else if (self.metadata.writable && !self.metadata.length) {
+          initialize()
+        } else {
+          restore()
+        }
+      })
     })
 
     /**
@@ -158,12 +161,12 @@ class Hyperdrive extends EventEmitter {
     /**
      * The first time the hyperdrive is created, we initialize both the db (metadata feed) and the content feed here.
      */
-    function initialize (keyPair) {
-      self._db.setMetadata(keyPair.publicKey)
-      self._db.ready(err => {
-        if (err) return cb(err)
-        self._getContent(self._db, { secretKey: keyPair.secretKey }, err => {
-          if (err) return cb(err)
+    function initialize () {
+      self._getContent(self._db, { initialize: true }, (err, contentState) => {
+        if (err) return done(err)
+        self._db.setMetadata(contentState.feed.key)
+        self._db.ready(err => {
+          if (err) return done(err)
           return done(null)
         })
       })
@@ -178,7 +181,7 @@ class Hyperdrive extends EventEmitter {
       if (self.metadata.writable) {
         self._db.ready(err => {
           if (err) return done(err)
-          self._getContent(self._db, { secretKey: keyPair.secretKey }, done)
+          self._getContent(self._db, done)
         })
       } else {
         self._db.ready(done)
@@ -186,6 +189,7 @@ class Hyperdrive extends EventEmitter {
     }
 
     function done (err) {
+      self.metadata.ifAvailable.continue()
       if (err) return cb(err)
       self.key = self.metadata.key
       self.discoveryKey = self.metadata.discoveryKey
@@ -194,6 +198,7 @@ class Hyperdrive extends EventEmitter {
 
     function onerror (err) {
       if (err) self.emit('error', err)
+      return cb(err)
     }
 
     function update () {
@@ -220,8 +225,7 @@ class Hyperdrive extends EventEmitter {
     const existingContent = self._contentStates.get(db)
     if (existingContent) return process.nextTick(cb, null, existingContent)
 
-    const mountMetadata = db.feed
-    const mountContentKeyPair = mountMetadata.secretKey ? contentKeyPair(mountMetadata.secretKey) : {}
+    if (opts && opts.initialize) return onkey(null)
 
     db.getMetadata((err, publicKey) => {
       if (err) return cb(err)
@@ -229,7 +233,7 @@ class Hyperdrive extends EventEmitter {
     })
 
     function onkey (publicKey) {
-      const contentOpts = { key: publicKey, ...contentOptions(self, (opts && opts.secretKey) || mountContentKeyPair.secretKey) }
+      const contentOpts = { key: publicKey, ...contentOptions(self), parents: [db.feed.key] }
       const feed = self._corestore.get(contentOpts)
       feed.ready(err => {
         if (err) return cb(err)
@@ -266,7 +270,11 @@ class Hyperdrive extends EventEmitter {
       } catch (err) {
         return cb(err)
       }
+      const oldMetadata = decoded.metadata
       const newStat = Object.assign(decoded, stat)
+      if (stat.metadata) {
+        newStat.metadata = Object.assign({}, oldMetadata || {}, stat.metadata)
+      }
       return this._putStat(name, newStat, { flags: st.flags }, cb)
     })
   }
@@ -278,7 +286,7 @@ class Hyperdrive extends EventEmitter {
       if (err) return cb(err)
       createFileDescriptor(this, name, flags, (err, fd) => {
         if (err) return cb(err)
-        cb(null, STDIO_CAP + this._fds.push(fd) - 1)
+        cb(null, STDIO_CAP + (this._fds.push(fd) - 1) * 2)
       })
     })
   }
@@ -289,7 +297,7 @@ class Hyperdrive extends EventEmitter {
       pos = null
     }
 
-    const desc = this._fds[fd - STDIO_CAP]
+    const desc = this._fds[(fd - STDIO_CAP) / 2]
     if (!desc) return process.nextTick(cb, new errors.BadFileDescriptor(`Bad file descriptor: ${fd}`))
     if (pos == null) pos = desc.position
     desc.read(buf, offset, len, pos, cb)
@@ -301,7 +309,7 @@ class Hyperdrive extends EventEmitter {
       pos = null
     }
 
-    const desc = this._fds[fd - STDIO_CAP]
+    const desc = this._fds[(fd - STDIO_CAP) / 2]
     if (!desc) return process.nextTick(cb, new errors.BadFileDescriptor(`Bad file descriptor: ${fd}`))
     if (pos == null) pos = desc.position
     desc.write(buf, offset, len, pos, cb)
@@ -541,9 +549,12 @@ class Hyperdrive extends EventEmitter {
     const self = this
 
     const statConstructor = (opts && opts.directory) ? Stat.directory : Stat.file
-    this._db.get(name, (err, node, trie) => {
+    this.ready(err => {
       if (err) return cb(err)
-      onexisting(node, trie)
+      this._db.get(name, (err, node, trie) => {
+        if (err) return cb(err)
+        onexisting(node, trie)
+      })
     })
 
     function onexisting (node, trie) {
@@ -667,12 +678,13 @@ class Hyperdrive extends EventEmitter {
     const recursive = !!(opts && opts.recursive)
 
     const nameStream = pump(
-      createStatStream(this, this._db, name, { ...opts, recursive }),
+      createStatStream(this, this._db, name, { ...opts, recursive, gt: false }),
       through.obj(({ path: statPath, stat }, enc, cb) => {
         const relativePath = (name === statPath) ? statPath : path.relative(name, statPath)
         if (relativePath === name) return cb(null)
         if (recursive) return cb(null, relativePath)
-        return cb(null, relativePath.split('/')[0])
+        const split = relativePath.split('/')
+        return cb(null, split[0])
       })
     )
     return collect(nameStream, (err, entries) => {
@@ -711,8 +723,18 @@ class Hyperdrive extends EventEmitter {
     })
   }
 
-  replicate (opts) {
-    return this._corestore.replicate(opts)
+  replicate (isInitiator, opts) {
+    // support replicate({ initiator: bool }) also
+    if (typeof isInitiator === 'object' && isInitiator && !opts) {
+      opts = isInitiator
+      isInitiator = !!opts.initiator
+    }
+    const stream = new HypercoreProtocol(isInitiator, { ...opts })
+    this.ready(err => {
+      if (err) return stream.destroy(err)
+      this._corestore.replicate(isInitiator, this.discoveryKey, { ...opts, stream })
+    })
+    return stream
   }
 
   checkout (version, opts) {
@@ -727,9 +749,10 @@ class Hyperdrive extends EventEmitter {
   }
 
   _closeFile (fd, cb) {
-    const desc = this._fds[fd - STDIO_CAP]
+    const idx = (fd - STDIO_CAP) / 2
+    const desc = this._fds[idx]
     if (!desc) return process.nextTick(cb, new Error('Invalid file descriptor'))
-    this._fds[fd - STDIO_CAP] = null
+    this._fds[idx] = null
     while (this._fds.length && !this._fds[this._fds.length - 1]) this._fds.pop()
     desc.close(cb)
   }
@@ -748,165 +771,160 @@ class Hyperdrive extends EventEmitter {
     })
   }
 
-  fileStats (path, opts, cb) {
-    if (typeof opts === 'function') return this.fileStats(path, null, opts)
+  stats (path, opts, cb) {
+    if (typeof opts === 'function') return this.stats(path, null, opts)
+    const self = this
+    const total = emptyStats()
+    const stats = new Map()
 
-    const total = (opts && opts.total) || emptyDownloadTotal()
-
-    return this.stat(path, (err, stat, trie) => {
+    this.stat(path, (err, stat, trie) => {
       if (err) return cb(err)
-      this._getContent(trie, (err, contentState) => {
-        if (err) return cb(err)
-        const downloadedBlocks = contentState.feed.downloaded(stat.offset, stat.offset + stat.blocks)
-        if (!stat.totalBlocks) total.blocks = stat.blocks
-        if (!stat.totalBytes) total.size = stat.size
-
-        total.downloadedBlocks = downloadedBlocks
-        // TODO: This is not possible to implement now. Need a better byte length index in hypercore.
-        total.downloadedBytes = 0
-
-        return cb(null, total)
-      })
+      if (stat.isFile()) {
+        return fileStats(path, cb)
+      } else {
+        const recursive = opts && (opts.recursive !== false)
+        const ite = statIterator(self, self._db, path, { recursive })
+        return ite.next(function loop (err, info) {
+          if (err) return cb(err)
+          if (!info) return cb(null, stats)
+          fileStats(info.path, (err, fileStats) => {
+            if (err) return cb(err)
+            stats.set(info.path, fileStats)
+            return ite.next(loop)
+          })
+        })
+      }
     })
+
+    function onstats (err, path, fileStats) {
+      if (err) return cb(err)
+      stats.set(path, fileStats)
+    }
+
+    function fileStats (path, cb) {
+      return self.stat(path, (err, stat, trie) => {
+        if (err) return cb(err)
+        return self._getContent(trie, (err, contentState) => {
+          if (err) return cb(err)
+          const downloadedBlocks = contentState.feed.downloaded(stat.offset, stat.offset + stat.blocks)
+          total.blocks = stat.blocks
+          total.size = stat.size
+          total.downloadedBlocks = downloadedBlocks
+          // TODO: This is not possible to implement now. Need a better byte length index in hypercore.
+          // total.downloadedBytes = 0
+          return cb(null, total)
+        })
+      })
+    }
+
+    function emptyStats () {
+      return {
+        blocks: 0,
+        size: 0,
+        downloadedBlocks: 0,
+      }
+    }
   }
 
-  download (path, opts) {
+  watchStats (path, opts) {
     const self = this
-    const handle = new EventEmitter()
-    const snapshot = this.checkout(this.version)
-    const fileInfos = new Map()
-    const fileTotals = new Map()
-
-    const overall = emptyDownloadTotal()
-    overall.remaining = 0
-    overall.completed = false
-    overall.cancelled = false
-
-    var allDownloading = false
+    var timer = setInterval(collectStats, (opts && opts.statsInveral) || 2000)
     var collecting = false
-    var timer = null
+    var destroyed = false
 
-    // Start all downloads.
-    start()
-
+    const handle = new EventEmitter()
     Object.assign(handle, {
-      cancel
+      destroy
     })
     return handle
-
-    function start () {
-      timer = setInterval(collectStats, (opts && opts.statsInterval) || 2000)
-      setImmediate(collectStats)
-      snapshot.stat(path, (err, stat, trie) => {
-        if (err) return cancel(err)
-        if (stat.isFile()) {
-          startFile({ path, stat, trie })
-          onAllDownloading()
-        } else {
-          const ite = statIterator(snapshot, snapshot._db, path, { recursive: true })
-          ite.next(function loop (err, info) {
-            if (err || overall.cancelled) return cancel(err)
-            if (!info) return onAllDownloading()
-            startFile(info)
-            ite.next(loop)
-          })
-        }
-      })
-    }
-
-    function startFile (info) {
-      const { stat, path, trie } = info
-
-      // Symlinks might mean that the same file is referenced multiple times. Skip in that case
-      if (fileInfos.get(path)) return
-
-      const dlInfo = { stat }
-      fileInfos.set(path, dlInfo)
-
-      const total = emptyDownloadTotal()
-      total.blocks = stat.blocks
-      total.size = stat.size
-      fileTotals.set(path, total)
-
-      self._getContent(trie, (err, contentState) => {
-        if (err) return cancel(err)
-        dlInfo.feed = contentState.feed
-        overall.blocks += stat.blocks
-        overall.size += stat.size
-        dlInfo.range = dlInfo.feed.download({
-          start: stat.offset,
-          end: stat.offset + stat.blocks
-        }, err => onFinish(err, path, stat))
-        overall.remaining++
-      })
-    }
-
-    function progress (err) {
-      if (err) return cancel(err)
-      collecting = false
-      if (!overall.completed) handle.emit('progress', overall, fileTotals)
-    }
-
-    function cancel (err) {
-      if (overall.cancelled) return
-      overall.cancelled = true
-      for (const [path, { feed, range }] of fileInfos) {
-        feed.undownload(range)
-      }
-      cleanup()
-      handle.emit('cancel', err, overall, fileTotals)
-    }
-
-    function cleanup () {
-      if (timer) clearInterval(timer)
-    }
-
-    function onAllDownloading () {
-      allDownloading = true
-      handle.emit('start', overall)
-    }
-
-    function onFinish (err, name, stat) {
-      if (err) return cancel(err)
-      overall.downloadedBlocks += stat.blocks
-      overall.downloadedBytes += stat.size
-      const total = fileTotals.get(name)
-      if(!--overall.remaining && allDownloading) {
-        collectStats()
-        handle.once('progress', finish)
-       }
-    }
-
-    function finish () {
-      overall.completed = true
-      handle.emit('finish', overall, fileTotals)
-      cleanup()
-    }
 
     function collectStats () {
       if (collecting) return
       collecting = true
-      if (opts && opts.detailed) {
-        collectFileStats(progress)
-      } else {
-        process.nextTick(progress, null)
-      }
+      self.stats(path, opts, (err, stats) => {
+        if (err) return destroy(err)
+        collecting = false
+        handle.stats = stats
+        handle.emit('update')
+      })
     }
 
-    function collectFileStats (cb) {
-      var remaining = fileInfos.size
-      if (!fileInfos.size) return process.nextTick(cb, null)
-      overall.downloadedBlocks = 0
-      for (let [name, info] of fileInfos) {
-        const total = fileTotals.get(name)
-        const existing = !!total
-        snapshot.fileStats(name, { total }, (err, total) => {
-          if (err) return cb(err)
-          overall.downloadedBlocks += total.downloadedBlocks
-          if (!existing) fileTotals.set(name, total)
-          if (!--remaining) return cb(null)
-        })
+    function destroy (err) {
+      handle.emit('destroy', err)
+      clearInterval(timer)
+      destroyed = true
+    }
+  }
+
+  download (path, opts) {
+    const self = this
+    const ranges = new Map()
+    var pending = 0
+    var destroyed = false
+
+    const handle = new EventEmitter()
+    Object.assign(handle, {
+      destroy
+    })
+
+    self.stat(path, (err, stat, trie) => {
+      if (err) return destroy(err)
+      if (stat.isFile()) {
+        downloadFile(path, stat, trie, destroy)
+      } else {
+        const recursive = opts && (opts.recursive !== false)
+        const ite = statIterator(self, self._db, path, { recursive, random: true })
+        downloadNext(ite)
       }
+    })
+
+    return handle
+
+    function downloadNext (ite) {
+      if (destroyed) return
+      ite.next((err, info) => {
+        if (err) return destroy(err)
+        if (!info) {
+          if (!ranges.size) return destroy(null)
+          else return
+        }
+        const { path, stat, trie } = info
+        downloadFile(path, stat, trie, err => {
+          if (err) return destroy(err)
+          return downloadNext(ite)
+        })
+        if (pending < ((opts && opts.maxConcurrent) || 50)) {
+          return downloadNext(ite)
+        }
+      })
+    }
+
+    function downloadFile (path, stat, trie, cb) {
+      pending++
+      self._getContent(trie, (err, contentState) => {
+        if (err) return destroy(err)
+        const feed = contentState.feed
+        const range = feed.download({
+          start: stat.offset,
+          end: stat.offset + stat.blocks
+        }, err => {
+          pending--
+          if (err) return cb(err)
+          ranges.delete(path)
+          return cb(null)
+        })
+        ranges.set(path, { range, feed })
+      })
+    }
+
+    function destroy (err) {
+      if (destroyed) return
+      destroyed = true
+      for (const [path, { feed, range }] of ranges) {
+        feed.undownload(range)
+      }
+      if (err) handle.emit('error', err)
+      else handle.emit('finish')
     }
   }
 
@@ -938,6 +956,7 @@ class Hyperdrive extends EventEmitter {
       const core = this._corestore.get({
         key,
         ...opts,
+        parents: [this.key],
         sparse: this.sparse
       })
       core.ready(err => {
@@ -962,7 +981,6 @@ class Hyperdrive extends EventEmitter {
       self._createStat(path, statOpts, (err, st) => {
         if (err) return cb(err)
         self._db.mount(path, key, { ...opts, value: st.encode() }, err => {
-          if (err) return cb(err)
           return self._db.loadMount(path, cb)
         })
       })
@@ -1034,15 +1052,6 @@ function fixName (name) {
   name = unixify(name)
   if (!name.startsWith('/')) name = '/' + name
   return name
-}
-
-function emptyDownloadTotal () {
-  return {
-    blocks: 0,
-    size: 0,
-    downloadedBlocks: 0,
-    downloadedBytes: 0,
-  }
 }
 
 function noop () {}

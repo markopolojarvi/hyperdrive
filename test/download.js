@@ -21,11 +21,11 @@ test('single-file download', t => {
     drive1.writeFile('hello', 'world', err => {
       t.error(err, 'no error')
       setImmediate(() => {
-        drive2.fileStats('hello', (err, totals) => {
+        drive2.stats('hello', (err, totals) => {
           t.error(err, 'no error')
           t.same(totals.blocks, 1)
           t.same(totals.downloadedBlocks, 0)
-          const handle = drive2.download('hello', { detailed: true })
+          const handle = drive2.download('hello')
           ondownloading(handle)
         })
       })
@@ -33,11 +33,11 @@ test('single-file download', t => {
   }
 
   function ondownloading (handle) {
-    handle.on('finish', (total, byFile) => {
-      t.same(total.downloadedBlocks, 1)
-      t.same(total.downloadedBytes, 5)
-      t.same(byFile.get('hello').downloadedBlocks, 1)
-      t.end()
+    handle.on('finish', () => {
+      drive2.stats('hello', (err, totals) => {
+        t.same(totals.downloadedBlocks, 1)
+        t.end()
+      })
     })
     handle.on('error', t.fail.bind(t))
     handle.on('cancel', t.fail.bind(t))
@@ -66,7 +66,7 @@ test('directory download', t => {
         drive1.writeFile('a/3', '3', err => {
           t.error(err, 'no error')
           setImmediate(() => {
-            const handle = drive2.download('a', { detailed: true })
+            const handle = drive2.download('a', { maxConcurrent: 1 })
             ondownloading(handle)
           })
         })
@@ -75,16 +75,16 @@ test('directory download', t => {
   }
 
   function ondownloading (handle) {
-    handle.on('finish', (total, byFile) => {
-      t.same(total.downloadedBlocks, 3)
-      t.same(total.downloadedBytes, Buffer.from('1').length * 3)
-      t.same(byFile.get('/a/1').downloadedBlocks, 1)
-      t.same(byFile.get('/a/2').downloadedBlocks, 1)
-      t.same(byFile.get('/a/3').downloadedBlocks, 1)
-      t.end()
+    handle.on('finish', () => {
+      drive2.stats('a', (err, totals) => {
+        t.error(err, 'no error')
+        t.same(totals.get('/a/1').downloadedBlocks, 1)
+        t.same(totals.get('/a/2').downloadedBlocks, 1)
+        t.same(totals.get('/a/3').downloadedBlocks, 1)
+        t.end()
+      })
     })
     handle.on('error', t.fail.bind(t))
-    handle.on('cancel', t.fail.bind(t))
   }
 })
 
@@ -127,15 +127,15 @@ test('download cancellation', t => {
 
   function ondownloading (handle) {
     setTimeout(() => {
-      handle.cancel()
+      handle.destroy()
     }, 1000)
-    handle.on('cancel', (err, total, byFile) => {
+    handle.on('finish', (err, total, byFile) => {
       if (err) t.fail(err)
-      t.true(total.downloadedBlocks > 0)
-      t.true(total.downloadedBlocks < 100)
-      t.true(byFile.get('a').downloadedBlocks > 0)
-      t.true(byFile.get('a').downloadedBlocks < 100)
-      t.end()
+      drive2.stats('a', (err, totals) => {
+        t.error(err, 'no error')
+        t.true(totals.downloadedBlocks > 0 && totals.downloadedBlocks < 100)
+        t.end()
+      })
     })
     handle.on('error', t.fail.bind(t))
   }

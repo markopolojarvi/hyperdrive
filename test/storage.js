@@ -58,14 +58,15 @@ tape('dir storage for non-writable drive', function (t) {
         })
       })
 
-      var stream = clone.replicate()
-      stream.pipe(src.replicate()).pipe(stream)
+      var stream = clone.replicate(true)
+      stream.pipe(src.replicate(false)).pipe(stream)
     })
   })
 })
 
 tape('dir storage without permissions emits error', function (t) {
-  t.plan(1)
+  // TODO: This error should not be emitted twice -- fix error propagation.
+  t.plan(2)
   var drive = hyperdrive('/')
   drive.on('error', function (err) {
     t.ok(err, 'got error')
@@ -83,8 +84,8 @@ tape('write and read (sparse)', function (t) {
       clone.on('ready', function () {
         drive.writeFile('/hello.txt', 'world', function (err) {
           t.error(err, 'no error')
-          var stream = clone.replicate({ live: true, encrypt: false })
-          stream.pipe(drive.replicate({ live: true, encrypt: false })).pipe(stream)
+          var stream = clone.replicate(true, { live: true })
+          stream.pipe(drive.replicate(false, { live: true })).pipe(stream)
           setTimeout(() => {
             var readStream = clone.createReadStream('/hello.txt')
             readStream.on('error', function (err) {
@@ -104,13 +105,16 @@ tape('sparse read/write two files', function (t) {
   var drive = create()
   drive.on('ready', function () {
     var clone = create(drive.key, { sparse: true })
-    drive.writeFile('/hello.txt', 'world', function (err) {
+    clone.ready(err => {
       t.error(err, 'no error')
-      drive.writeFile('/hello2.txt', 'world', function (err) {
+      drive.writeFile('/hello.txt', 'world', function (err) {
         t.error(err, 'no error')
-        var stream = clone.replicate({ live: true, encrypt: false })
-        stream.pipe(drive.replicate({ live: true, encrypt: false })).pipe(stream)
-        clone.metadata.update(start)
+        drive.writeFile('/hello2.txt', 'world', function (err) {
+          t.error(err, 'no error')
+          var stream = clone.replicate(true, { live: true })
+          stream.pipe(drive.replicate(false, { live: true })).pipe(stream)
+          clone.metadata.update(start)
+        })
       })
     })
 
